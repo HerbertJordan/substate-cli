@@ -41,6 +41,7 @@ func init() {
 		replay.GetAddressStatsCommand,
 		replay.GetKeyStatsCommand,
 		replay.GetLocationStatsCommand,
+		replay.GetBlockStatsCommand,
 		dbCommand,
 	}
 	cli.CommandHelpTemplate = flags.CommandHelpTemplate
