@@ -179,9 +179,10 @@ type loc struct {
 }
 
 type FlatStorage struct {
-	addr_index map[common.Address]addr_id
-	key_index  map[common.Hash]key_id
-	loc_index  map[loc]loc_id
+	addr_index        map[common.Address]addr_id
+	key_index         map[common.Hash]key_id
+	loc_index         map[loc]loc_id
+	reverse_loc_index map[loc_id]loc
 
 	counter       int
 	bucket_counts []uint64
@@ -190,11 +191,12 @@ type FlatStorage struct {
 
 func NewFlatStorage() *FlatStorage {
 	return &FlatStorage{
-		addr_index:    map[common.Address]addr_id{},
-		key_index:     map[common.Hash]key_id{},
-		loc_index:     map[loc]loc_id{},
-		bucket_counts: make([]uint64, 0),
-		count_lists:   make([][]uint64, 0),
+		addr_index:        map[common.Address]addr_id{},
+		key_index:         map[common.Hash]key_id{},
+		loc_index:         map[loc]loc_id{},
+		reverse_loc_index: map[loc_id]loc{},
+		bucket_counts:     make([]uint64, 0),
+		count_lists:       make([][]uint64, 0),
 	}
 }
 
@@ -223,6 +225,7 @@ func (s *FlatStorage) getLocationId(addr common.Address, key common.Hash) loc_id
 	}
 	res := loc_id(len(s.loc_index))
 	s.loc_index[loc] = res
+	s.reverse_loc_index[res] = loc
 	return res
 }
 
@@ -231,6 +234,21 @@ func (s *FlatStorage) access(pos loc_id) {
 	if len(s.bucket_counts) < int(bucket+1) {
 		s.bucket_counts = append(s.bucket_counts, make([]uint64, int(bucket)-len(s.bucket_counts)+1)...)
 	}
+	s.bucket_counts[bucket]++
+
+	// Swap location with parent
+	loc := s.reverse_loc_index[pos]
+	parent_pos := pos / 2
+	parent_loc := s.reverse_loc_index[parent_pos]
+
+	s.loc_index[parent_loc] = pos
+	s.reverse_loc_index[pos] = parent_loc
+
+	s.loc_index[loc] = parent_pos
+	s.reverse_loc_index[parent_pos] = loc
+
+	// Register swap as an access.
+	bucket = parent_pos / (1 << 15)
 	s.bucket_counts[bucket]++
 
 	// Collect statistics.
