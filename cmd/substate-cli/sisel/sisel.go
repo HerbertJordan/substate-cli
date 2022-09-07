@@ -46,7 +46,10 @@ var BudgetFlag = cli.IntFlag{
 	Value: 5,
 }
 
-func getSavings(blocks []BlockStructure, instruction_set InstructionSet) int64 {
+// getSavings computes the true savings obtainable by a given instruction set by
+// computing the optimal instruction selection of each block and the resulting
+// cost savings compared to a setup without super instructions.
+func getSavings(blocks []BlockStructure, instruction_set InstructionSet, workers int) int64 {
 
 	decoded_set := instruction_set.AsMap()
 
@@ -55,7 +58,7 @@ func getSavings(blocks []BlockStructure, instruction_set InstructionSet) int64 {
 	res := make(chan int64, 1)
 
 	// Start workers processing blocks.
-	for i := 0; i < 12; i++ {
+	for i := 0; i < workers; i++ {
 		go func() {
 			for block := range in {
 				saving := block.GetSavingFor(decoded_set)
@@ -83,80 +86,20 @@ func getSavings(blocks []BlockStructure, instruction_set InstructionSet) int64 {
 	return <-res
 }
 
-func getUpperBoundForExtraSaving(instruction_set InstructionSet, instructions []InstructionInfo, budget int) int64 {
-	count := instruction_set.Size()
-	var res int64
-	if count >= budget {
-		return res
-	}
-	for _, cur := range instructions {
-		if !instruction_set.Contains(cur.instruction) {
-			res += int64(cur.savings)
-			count++
-			if count >= budget {
-				return res
-			}
-		}
-	}
-	return res
-}
-
 type InstructionInfo struct {
 	instruction SuperInstructionId
 	savings     uint64
 }
 
-type Candidate struct {
-	instruction_set   InstructionSet
-	minimum_potential int64
-	maximum_potential int64
-}
-
-// Worklist implements a heap
-type WorkList []Candidate
-
-func (w *WorkList) Len() int {
-	return len(*w)
-}
-
-func (w *WorkList) Less(i, j int) bool {
-	// We force a maximum-heap
-	/*
-		if (*w)[i].instruction_set.Size() > (*w)[j].instruction_set.Size() {
-			return true
-		}
-		if (*w)[i].instruction_set.Size() < (*w)[j].instruction_set.Size() {
-			return false
-		}
-	*/
-	a := &(*w)[i]
-	b := &(*w)[j]
-
-	if a.minimum_potential > b.minimum_potential {
-		return true
-	}
-	if a.minimum_potential < b.minimum_potential {
-		return false
-	}
-
-	return a.maximum_potential > b.maximum_potential
-
-	//return (*w)[i].minimum_potential > (*w)[j].minimum_potential
-	//return (*w)[i].maximum_potential > (*w)[j].maximum_potential
-}
-
-func (w *WorkList) Swap(i, j int) {
-	(*w)[i], (*w)[j] = (*w)[j], (*w)[i]
-}
-
-func (w *WorkList) Push(x any) {
-	*w = append(*w, x.(Candidate))
-}
-
-func (w *WorkList) Pop() (res any) {
-	res = (*w)[w.Len()-1]
-	*w = (*w)[:w.Len()-1]
-	return
+type SelectionProblem struct {
+	// The list of possible super instructions and their frequencies
+	instructions []InstructionInfo
+	// The index of super instructions containing meta information like the actual instruction sequences
+	instruction_index SuperInstructionIndex
+	// The list of all blocks and their structure information
+	block_structure []BlockStructure
+	// The maximum number of instructions to be selected
+	budget int
 }
 
 func siselAction(ctx *cli.Context) error {
@@ -181,10 +124,6 @@ func siselAction(ctx *cli.Context) error {
 		instructions[i].savings = frequencies[i] * uint64(index.Get(SuperInstructionId(i)).Size()-1)
 	}
 	frequencies = nil
-	sort.Slice(instructions, func(i, j int) bool { return instructions[i].savings > instructions[j].savings })
-
-	// Sort list of blocks by size in decreasing order.
-	sort.Slice(block_structure, func(i, j int) bool { return block_structure[i].structure.rows > block_structure[j].structure.rows })
 
 	// Start CPU profiling if requested.
 	profile_file_name := ctx.String(replay.CpuProfilingFlag.Name)
@@ -197,8 +136,33 @@ func siselAction(ctx *cli.Context) error {
 		defer pprof.StopCPUProfile()
 	}
 
-	// Get instruction budget.
-	budget := ctx.Int(BudgetFlag.Name)
+	// Run the actual solver.
+	best_set, savings := runBranchAndBound(&SelectionProblem{
+		instructions:      instructions,
+		instruction_index: index,
+		block_structure:   block_structure,
+		budget:            ctx.Int(BudgetFlag.Name),
+	}, ctx.Int(substate.WorkersFlag.Name))
+
+	fmt.Printf("\n----------------------\n")
+	fmt.Printf("Best instruction set:\n")
+	best_set.Print(&index)
+	fmt.Printf("Expected savings: %d\n", savings)
+
+	return nil
+}
+
+func runBranchAndBound(selectionProblem *SelectionProblem, workers int) (InstructionSet, int64) {
+	instructions := selectionProblem.instructions
+	index := selectionProblem.instruction_index
+	block_structure := selectionProblem.block_structure
+	budget := selectionProblem.budget
+
+	// To prune the search space, we need the instructions to be sorted by their saving potential.
+	sort.Slice(instructions, func(i, j int) bool { return instructions[i].savings > instructions[j].savings })
+
+	// Sort list of blocks by size in decreasing order to enable better load balancing in parallel block evaluations.
+	sort.Slice(block_structure, func(i, j int) bool { return block_structure[i].structure.rows > block_structure[j].structure.rows })
 
 	fmt.Printf("\n=============== Greedy Search ===============\n")
 
@@ -215,7 +179,7 @@ func siselAction(ctx *cli.Context) error {
 	}
 
 	best_instructions := instruction_set
-	best_savings := getSavings(block_structure, instruction_set)
+	best_savings := getSavings(block_structure, instruction_set, workers)
 	fmt.Printf("Savings of greedy instruction set: %d (%.1f%%)\n", best_savings, (float64(best_savings)/float64(max_savings))*100)
 
 	fmt.Printf("\n=============== Branch & Bound Search ===============\n")
@@ -225,19 +189,8 @@ func siselAction(ctx *cli.Context) error {
 	work_list := &WorkList{}
 
 	heap.Push(work_list, Candidate{InstructionSet{}, 0, max_savings})
-	/*
-		work_list := []Candidate{
-			{MakeEmptyInstructionSet(), max_savings},
-		}
-	*/
 
-	//for len(work_list) > 0 {
 	for work_list.Len() > 0 {
-		fmt.Printf("\nWork-queue length: %d\n", work_list.Len())
-		/*
-			cur := work_list[len(work_list)-1]
-			work_list = work_list[:len(work_list)-1]
-		*/
 		cur := heap.Pop(work_list).(Candidate)
 
 		// If by now a better option has been found, skip this one.
@@ -247,6 +200,7 @@ func siselAction(ctx *cli.Context) error {
 		}
 
 		steps++
+		fmt.Printf("\nStep %d - Work-queue length: %d\n", steps, work_list.Len())
 
 		// Compute saving of current instruction set.
 		fmt.Printf("Processing\n")
@@ -254,7 +208,7 @@ func siselAction(ctx *cli.Context) error {
 		fmt.Printf("Maximum Potential:  %30d\n", cur.maximum_potential)
 		fmt.Printf("Minimum Potential:  %30d\n", cur.minimum_potential)
 
-		savings := getSavings(block_structure, cur.instruction_set)
+		savings := getSavings(block_structure, cur.instruction_set, workers)
 		fmt.Printf("Actual savings:     %30d (%.1f%%)\n", savings, (float64(savings)/float64(max_savings))*100)
 		if best_savings < savings {
 			fmt.Printf("NEW BEST!\n")
@@ -268,15 +222,13 @@ func siselAction(ctx *cli.Context) error {
 
 		// Compute extensions
 		if cur.instruction_set.Size() < budget {
-			max_id := 0
-			for instruction := range cur.instruction_set.AsMap() {
-				if max_id < int(instruction) {
-					max_id = int(instruction)
-				}
+			max_id := SuperInstructionId(0)
+			if !cur.instruction_set.Empty() {
+				max_id = cur.instruction_set.At(cur.instruction_set.Size() - 1)
 			}
 
 			for _, instruction := range instructions {
-				if int(instruction.instruction) < max_id {
+				if instruction.instruction < max_id {
 					continue
 				}
 				if cur.instruction_set.Contains(instruction.instruction) {
@@ -293,30 +245,75 @@ func siselAction(ctx *cli.Context) error {
 				// Estimate potential of new solution.
 				minimum_potential := savings
 				maximum_potential := minimum_potential + int64(instruction.savings) + getUpperBoundForExtraSaving(new_set, instructions, budget)
-				/*
-					fmt.Printf("New set:\n")
-					new_set.Print(&index)
-					fmt.Printf("  savings of parent:           %d\n", savings)
-					fmt.Printf("  added instruction potential: %d\n", instruction.savings)
-					fmt.Printf("  upper bound:                 %d\n", getUpperBoundForExtraSaving(new_set, instructions, budget))
-					fmt.Printf("  total potential:             %d\n", potential)
-				*/
 				if maximum_potential > best_savings {
-					//work_list = append(work_list, Candidate{new_set, potential})
 					heap.Push(work_list, Candidate{new_set, minimum_potential, maximum_potential})
 				} else {
 					// Instuctions are orderd by potential, nothing that follows will be stronger.
 					break
-					//fmt.Printf("Pruned %v, to small potential\n", instruction.instruction)
 				}
 			}
 		}
 	}
 	fmt.Printf("Search took %d steps\n", steps)
-	fmt.Printf("\n----------------------\n")
-	fmt.Printf("Best instruction set:\n")
-	best_instructions.Print(&index)
-	fmt.Printf("Realized savings: %d (%.1f%%)\n", best_savings, (float64(best_savings)/float64(max_savings))*100)
+	return best_instructions, best_savings
+}
 
-	return nil
+type Candidate struct {
+	instruction_set   InstructionSet
+	minimum_potential int64
+	maximum_potential int64
+}
+
+// Worklist implements a heap
+type WorkList []Candidate
+
+func (w *WorkList) Len() int {
+	return len(*w)
+}
+
+func (w *WorkList) Less(i, j int) bool {
+	// We force a maximum-heap
+	a := &(*w)[i]
+	b := &(*w)[j]
+
+	if a.minimum_potential > b.minimum_potential {
+		return true
+	}
+	if a.minimum_potential < b.minimum_potential {
+		return false
+	}
+
+	return a.maximum_potential > b.maximum_potential
+}
+
+func (w *WorkList) Swap(i, j int) {
+	(*w)[i], (*w)[j] = (*w)[j], (*w)[i]
+}
+
+func (w *WorkList) Push(x any) {
+	*w = append(*w, x.(Candidate))
+}
+
+func (w *WorkList) Pop() (res any) {
+	res = (*w)[w.Len()-1]
+	*w = (*w)[:w.Len()-1]
+	return
+}
+
+func getUpperBoundForExtraSaving(instruction_set InstructionSet, instructions []InstructionInfo, budget int) int64 {
+	count := instruction_set.Size()
+	var res int64
+	if count >= budget {
+		return res
+	}
+	for _, cur := range instructions {
+		if !instruction_set.Contains(cur.instruction) {
+			res += int64(cur.savings)
+			count++
+			if count >= budget {
+				return res
+			}
+		}
+	}
+	return res
 }

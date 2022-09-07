@@ -3,6 +3,7 @@ package sisel
 import (
 	"database/sql"
 	"encoding/hex"
+	"fmt"
 
 	"github.com/ethereum/go-ethereum/core/vm"
 	_ "github.com/mattn/go-sqlite3"
@@ -20,11 +21,11 @@ func LoadBlocks(db_file string) ([]BlockInfo, error) {
 	}
 	defer db.Close()
 
-	/*
-		fmt.Printf("WARNING - limited number of blocks for development\n")
-		row, err := db.Query("SELECT instructions, sum(frequency) FROM BasicBlockFrequency GROUP BY instructions LIMIT 100")
-	*/
-	row, err := db.Query("SELECT instructions, sum(frequency) FROM BasicBlockFrequency GROUP BY instructions")
+	fmt.Printf("===========================================================\n")
+	fmt.Printf("= WARNING - using block size limit of 100 for development =\n")
+	fmt.Printf("===========================================================\n")
+	row, err := db.Query("SELECT instructions, sum(frequency) FROM BasicBlockFrequency WHERE length(instructions) <= 100 GROUP BY instructions")
+	//row, err := db.Query("SELECT instructions, sum(frequency) FROM BasicBlockFrequency GROUP BY instructions")
 	if err != nil {
 		return nil, err
 	}
@@ -47,10 +48,6 @@ func LoadBlocks(db_file string) ([]BlockInfo, error) {
 		block := make([]vm.OpCode, 0, len(code))
 		for _, opcode := range code {
 			block = append(block, vm.OpCode(opcode))
-		}
-
-		if len(block) > 50 {
-			continue
 		}
 
 		res = append(res, BlockInfo{Block: block, frequency: frequency})
