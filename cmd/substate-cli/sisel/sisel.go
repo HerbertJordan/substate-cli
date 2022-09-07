@@ -46,7 +46,9 @@ var BudgetFlag = cli.IntFlag{
 	Value: 5,
 }
 
-func getSavings(blocks []BlockStructure, instruction_set map[SuperInstructionId]int) int64 {
+func getSavings(blocks []BlockStructure, instruction_set InstructionSet) int64 {
+
+	decoded_set := instruction_set.AsMap()
 
 	in := make(chan BlockStructure, 100)
 	out := make(chan int64, 100)
@@ -56,7 +58,7 @@ func getSavings(blocks []BlockStructure, instruction_set map[SuperInstructionId]
 	for i := 0; i < 12; i++ {
 		go func() {
 			for block := range in {
-				saving := block.GetSavingFor(instruction_set)
+				saving := block.GetSavingFor(decoded_set)
 				out <- int64(saving) * block.frequency
 			}
 		}()
@@ -81,45 +83,14 @@ func getSavings(blocks []BlockStructure, instruction_set map[SuperInstructionId]
 	return <-res
 }
 
-type InstructionSet struct {
-	super_instructions map[SuperInstructionId]int
-}
-
-func MakeEmptyInstructionSet() InstructionSet {
-	return InstructionSet{super_instructions: map[SuperInstructionId]int{}}
-}
-
-func (s *InstructionSet) Size() int {
-	return len(s.super_instructions)
-}
-
-func (s *InstructionSet) ExtendBy(instruction SuperInstructionId) InstructionSet {
-	instructions := map[SuperInstructionId]int{}
-	for k, v := range s.super_instructions {
-		instructions[k] = v
-	}
-	instructions[instruction] = 0
-	return InstructionSet{super_instructions: instructions}
-}
-
-func (s *InstructionSet) Print(index *SuperInstructionIndex) {
-	fmt.Printf("Instruction set:\n")
-	if len(s.super_instructions) == 0 {
-		fmt.Printf("  <no super instructions>\n")
-	}
-	for k := range s.super_instructions {
-		fmt.Printf("  %v\n", index.Get(k))
-	}
-}
-
 func getUpperBoundForExtraSaving(instruction_set InstructionSet, instructions []InstructionInfo, budget int) int64 {
-	count := len(instruction_set.super_instructions)
+	count := instruction_set.Size()
 	var res int64
 	if count >= budget {
 		return res
 	}
 	for _, cur := range instructions {
-		if _, present := instruction_set.super_instructions[cur.instruction]; !present {
+		if !instruction_set.Contains(cur.instruction) {
 			res += int64(cur.savings)
 			count++
 			if count >= budget {
@@ -232,7 +203,7 @@ func siselAction(ctx *cli.Context) error {
 	fmt.Printf("\n=============== Greedy Search ===============\n")
 
 	// Estimate maximum saving potential
-	instruction_set := MakeEmptyInstructionSet()
+	instruction_set := InstructionSet{}
 	max_savings := getUpperBoundForExtraSaving(instruction_set, instructions, budget)
 	fmt.Printf("Upper bound of saving potential for %d instructions: %d\n", budget, max_savings)
 
@@ -240,11 +211,11 @@ func siselAction(ctx *cli.Context) error {
 	fmt.Printf("Computing savings for greedy solution ..\n")
 	for i := 0; i < budget; i++ {
 		fmt.Printf("  %v - %d\n", index.Get(instructions[i].instruction), instructions[i].savings)
-		instruction_set.super_instructions[instructions[i].instruction] = 0
+		instruction_set = instruction_set.Add(instructions[i].instruction)
 	}
 
 	best_instructions := instruction_set
-	best_savings := getSavings(block_structure, instruction_set.super_instructions)
+	best_savings := getSavings(block_structure, instruction_set)
 	fmt.Printf("Savings of greedy instruction set: %d (%.1f%%)\n", best_savings, (float64(best_savings)/float64(max_savings))*100)
 
 	fmt.Printf("\n=============== Branch & Bound Search ===============\n")
@@ -253,7 +224,7 @@ func siselAction(ctx *cli.Context) error {
 	steps := 0
 	work_list := &WorkList{}
 
-	heap.Push(work_list, Candidate{MakeEmptyInstructionSet(), 0, max_savings})
+	heap.Push(work_list, Candidate{InstructionSet{}, 0, max_savings})
 	/*
 		work_list := []Candidate{
 			{MakeEmptyInstructionSet(), max_savings},
@@ -283,7 +254,7 @@ func siselAction(ctx *cli.Context) error {
 		fmt.Printf("Maximum Potential:  %30d\n", cur.maximum_potential)
 		fmt.Printf("Minimum Potential:  %30d\n", cur.minimum_potential)
 
-		savings := getSavings(block_structure, cur.instruction_set.super_instructions)
+		savings := getSavings(block_structure, cur.instruction_set)
 		fmt.Printf("Actual savings:     %30d (%.1f%%)\n", savings, (float64(savings)/float64(max_savings))*100)
 		if best_savings < savings {
 			fmt.Printf("NEW BEST!\n")
@@ -298,7 +269,7 @@ func siselAction(ctx *cli.Context) error {
 		// Compute extensions
 		if cur.instruction_set.Size() < budget {
 			max_id := 0
-			for instruction := range cur.instruction_set.super_instructions {
+			for instruction := range cur.instruction_set.AsMap() {
 				if max_id < int(instruction) {
 					max_id = int(instruction)
 				}
@@ -308,7 +279,7 @@ func siselAction(ctx *cli.Context) error {
 				if int(instruction.instruction) < max_id {
 					continue
 				}
-				if _, present := cur.instruction_set.super_instructions[instruction.instruction]; present {
+				if cur.instruction_set.Contains(instruction.instruction) {
 					continue
 				}
 
@@ -317,7 +288,7 @@ func siselAction(ctx *cli.Context) error {
 				}
 
 				// Create extended instruction set
-				new_set := cur.instruction_set.ExtendBy(instruction.instruction)
+				new_set := cur.instruction_set.Add(instruction.instruction)
 
 				// Estimate potential of new solution.
 				minimum_potential := savings
