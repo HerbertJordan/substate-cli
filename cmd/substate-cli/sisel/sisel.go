@@ -384,24 +384,27 @@ func runStagedSolver(problem *SelectionProblem, workers int) (InstructionSet, in
 		if i == problem.budget {
 			break
 		}
+		/*
+			// Find the best solutions excluding every subset of the best solution.
+			// Those are sets providing strong bounds for estimating upper bounds for
+			// solutions in later stages.
+			for _, subset := range best.GetSubsets() {
+				if subset.Empty() {
+					continue
+				}
+				next_best := state.FindBest(SubProblem{i, subset})
 
-		// Find the best solutions excluding every subset of the best solution.
-		// Those are sets providing strong bounds for estimating upper bounds for
-		// solutions in later stages.
-		for _, subset := range best.GetSubsets() {
-			if subset.Empty() {
-				continue
+				fmt.Printf("\n\n=========================\n\n")
+				fmt.Printf("Best without\n")
+				subset.Print(&state.problem.instruction_index)
+				fmt.Printf("is\n")
+				next_best.Print(&state.problem.instruction_index)
+				fmt.Printf("\n\n=========================\n\n")
 			}
-			next_best := state.FindBest(SubProblem{i, subset})
-
-			fmt.Printf("\n\n=========================\n\n")
-			fmt.Printf("Best without\n")
-			subset.Print(&state.problem.instruction_index)
-			fmt.Printf("is\n")
-			next_best.Print(&state.problem.instruction_index)
-			fmt.Printf("\n\n=========================\n\n")
-		}
+		*/
 	}
+
+	fmt.Printf("\n=======================\nFull search took %d evaluations\n", len(state.eval_data)-len(state.problem.instructions))
 
 	// Find best encountered solution.
 	return state.GetBest()
@@ -410,6 +413,10 @@ func runStagedSolver(problem *SelectionProblem, workers int) (InstructionSet, in
 // Attempts to find the best instruction set with the given size. This function assumes
 // that a best solution for size-1 has already be found.
 func (s *StagedSolverState) FindBest(sub_problem SubProblem) (res InstructionSet) {
+	if sub_problem.budget <= 0 {
+		return InstructionSet{}
+	}
+
 	// Cache the results of this function.
 	if val, present := s.sub_best[sub_problem]; present {
 		return val
@@ -443,7 +450,7 @@ func (s *StagedSolverState) FindBest(sub_problem SubProblem) (res InstructionSet
 	heap.Push(worklist, Candidate{
 		instruction_set:   InstructionSet{},
 		minimum_potential: 0,
-		maximum_potential: s.getUpperBoundForExtraSavings(size, InstructionSet{}),
+		maximum_potential: s.getUpperBoundForExtraSavings(size, InstructionSet{}, excluding),
 	})
 
 	steps := 0
@@ -458,7 +465,7 @@ func (s *StagedSolverState) FindBest(sub_problem SubProblem) (res InstructionSet
 
 		steps++
 		fmt.Printf("\n")
-		fmt.Printf("Stage %d - Step %d - worklist lenght %d\n", size, steps, worklist.Len())
+		fmt.Printf("Evaluations %d - Stage %d - Step %d - worklist length %d\n", size, steps, len(s.eval_data)-len(s.problem.instructions), worklist.Len())
 
 		// Evaluate current instruction set.
 		fmt.Printf("Evaluating\n")
@@ -497,7 +504,7 @@ func (s *StagedSolverState) FindBest(sub_problem SubProblem) (res InstructionSet
 				seen[extended] = 0
 
 				min_potential := value
-				max_potential := value + int64(instruction.savings) + s.getUpperBoundForExtraSavings(size, extended)
+				max_potential := value + int64(instruction.savings) + s.getUpperBoundForExtraSavings(size, extended, excluding)
 
 				if max_potential > bound {
 					heap.Push(worklist, Candidate{
@@ -518,17 +525,18 @@ func (s *StagedSolverState) FindBest(sub_problem SubProblem) (res InstructionSet
 
 // Estimates an upper boundary of the maximum extra savings that can be obtained by expanding the given
 // instruction set to the provided budget.
-func (s *StagedSolverState) getUpperBoundForExtraSavings(budget int, set InstructionSet) int64 {
+func (s *StagedSolverState) getUpperBoundForExtraSavings(budget int, set InstructionSet, excluding InstructionSet) int64 {
 	// TODO: improve using savings already computed for non-singleton sets
+	// TODO: exclude instructions that are not allowed
 
 	// Empty sets need special handling to avoid recursive dependencies.
 	if set.Empty() {
 		// We use the best known solution for a one unit smaller budget ..
-		best := s.FindBest(SubProblem{budget: budget - 1})
+		best := s.FindBest(SubProblem{budget: budget - 1, excluding: excluding})
 
 		// and add the potential of the most promising instruction not included in the set.
 		for _, instruction := range s.problem.instructions {
-			if !best.Contains(instruction.instruction) {
+			if !best.Contains(instruction.instruction) && !excluding.Contains(instruction.instruction) {
 				return s.Eval(best) + int64(instruction.savings)
 			}
 		}
@@ -551,10 +559,12 @@ func (s *StagedSolverState) getUpperBoundForExtraSavings(budget int, set Instruc
 	space := budget - set.Size()
 
 	// See what is the best combination for this extra space.
-	if _, present := s.sub_best[SubProblem{budget: space}]; !present {
-		panic(fmt.Sprintf("Subproblem %v not precomuted!", SubProblem{budget: space}))
-	}
-	best := s.FindBest(SubProblem{budget: space})
+	/*
+		if _, present := s.sub_best[SubProblem{budget: space}]; !present {
+			panic(fmt.Sprintf("Subproblem %v not precomuted!", SubProblem{budget: space}))
+		}
+	*/
+	best := s.FindBest(SubProblem{budget: space, excluding: excluding})
 
 	// Check whether there are overlaps.
 	overlap := Intersect(best, set)
@@ -565,10 +575,12 @@ func (s *StagedSolverState) getUpperBoundForExtraSavings(budget int, set Instruc
 	}
 
 	// If there are overlap, look for the best solution without overlap.
-	if _, present := s.sub_best[SubProblem{budget: space, excluding: overlap}]; !present {
-		panic(fmt.Sprintf("Subproblem %v not precomuted!", SubProblem{budget: space, excluding: overlap}))
-	}
-	best = s.FindBest(SubProblem{budget: space, excluding: overlap})
+	/*
+		if _, present := s.sub_best[SubProblem{budget: space, excluding: overlap}]; !present {
+			panic(fmt.Sprintf("Subproblem %v not precomuted!", SubProblem{budget: space, excluding: overlap}))
+		}
+	*/
+	best = s.FindBest(SubProblem{budget: space, excluding: Union(overlap, excluding)})
 	return s.Eval(best)
 }
 
