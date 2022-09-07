@@ -465,7 +465,7 @@ func (s *StagedSolverState) FindBest(sub_problem SubProblem) (res InstructionSet
 
 		steps++
 		fmt.Printf("\n")
-		fmt.Printf("Evaluations %d - Stage %d - Step %d - worklist length %d\n", size, steps, len(s.eval_data)-len(s.problem.instructions), worklist.Len())
+		fmt.Printf("Evaluations %d - Stage %d - Step %d - worklist length %d\n", len(s.eval_data)-len(s.problem.instructions), size, steps, worklist.Len())
 
 		// Evaluate current instruction set.
 		fmt.Printf("Evaluating\n")
