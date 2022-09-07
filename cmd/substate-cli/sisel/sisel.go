@@ -136,8 +136,11 @@ func siselAction(ctx *cli.Context) error {
 		defer pprof.StopCPUProfile()
 	}
 
+	solver := runBranchAndBound
+	solver = runStagedSolver
+
 	// Run the actual solver.
-	best_set, savings := runBranchAndBound(&SelectionProblem{
+	best_set, savings := solver(&SelectionProblem{
 		instructions:      instructions,
 		instruction_index: index,
 		block_structure:   block_structure,
@@ -316,4 +319,276 @@ func getUpperBoundForExtraSaving(instruction_set InstructionSet, instructions []
 		}
 	}
 	return res
+}
+
+type SubProblem struct {
+	budget    int
+	excluding InstructionSet
+}
+
+type StagedSolverState struct {
+	// The stated instruction selection problem.
+	problem *SelectionProblem
+	// A record of the costs of every evaluated instruction set.
+	eval_data map[InstructionSet]int64
+	// The number of workers to be used for parallel operations.
+	workers int
+	// Solutions for subproblems
+	sub_best map[SubProblem]InstructionSet
+}
+
+func runStagedSolver(problem *SelectionProblem, workers int) (InstructionSet, int64) {
+	state := StagedSolverState{
+		problem:   problem,
+		eval_data: map[InstructionSet]int64{},
+		workers:   workers,
+		sub_best:  map[SubProblem]InstructionSet{},
+	}
+
+	// To prune the search space, we need the instructions to be sorted by their saving potential.
+	sort.Slice(state.problem.instructions, func(i, j int) bool {
+		return state.problem.instructions[i].savings > state.problem.instructions[j].savings
+	})
+
+	// Sort list of blocks by size in decreasing order to enable better load balancing in parallel block evaluations.
+	sort.Slice(state.problem.block_structure, func(i, j int) bool {
+		return state.problem.block_structure[i].structure.rows > state.problem.block_structure[j].structure.rows
+	})
+
+	// Stage 0 is easy, we can do this in one line.
+	fmt.Printf("================ Running Stage %d ================\n", 0)
+	state.eval_data[InstructionSet{}] = 0 // The empty instruction set has no savings.
+	state.sub_best[SubProblem{budget: 0}] = InstructionSet{}
+
+	// Stage 1 is also easy, it is part of the problem description.
+	fmt.Printf("================ Running Stage %d ================\n", 1)
+	for _, instruction := range problem.instructions {
+		state.eval_data[MakeSingletonSet(instruction.instruction)] = int64(instruction.savings)
+	}
+	s1_best := MakeSingletonSet(problem.instructions[0].instruction)
+	s1_second_best := MakeSingletonSet(problem.instructions[1].instruction)
+	state.sub_best[SubProblem{budget: 1}] = s1_best
+	state.sub_best[SubProblem{budget: 1, excluding: s1_best}] = s1_second_best
+
+	// Higher stages require more work.
+	for i := 2; i <= problem.budget; i++ {
+		fmt.Printf("================ Running Stage %d ================\n", 2)
+
+		// Look for the best of the given size.
+		best := state.FindBest(SubProblem{budget: i})
+
+		fmt.Printf("Best set for stage %d:\n", i)
+		best.Print(&state.problem.instruction_index)
+
+		// If we have reached the full budget, we are done.
+		if i == problem.budget {
+			break
+		}
+
+		// Find the best solutions excluding every subset of the best solution.
+		// Those are sets providing strong bounds for estimating upper bounds for
+		// solutions in later stages.
+		for _, subset := range best.GetSubsets() {
+			if subset.Empty() {
+				continue
+			}
+			next_best := state.FindBest(SubProblem{i, subset})
+
+			fmt.Printf("\n\n=========================\n\n")
+			fmt.Printf("Best without\n")
+			subset.Print(&state.problem.instruction_index)
+			fmt.Printf("is\n")
+			next_best.Print(&state.problem.instruction_index)
+			fmt.Printf("\n\n=========================\n\n")
+		}
+	}
+
+	// Find best encountered solution.
+	return state.GetBest()
+}
+
+// Attempts to find the best instruction set with the given size. This function assumes
+// that a best solution for size-1 has already be found.
+func (s *StagedSolverState) FindBest(sub_problem SubProblem) (res InstructionSet) {
+	// Cache the results of this function.
+	if val, present := s.sub_best[sub_problem]; present {
+		return val
+	}
+	defer func() {
+		s.sub_best[sub_problem] = res
+	}()
+
+	size := sub_problem.budget
+	excluding := sub_problem.excluding
+
+	// Start by building a Greedy Solution to establish a lower limit on the bound.
+	// The greedy set is the best found so far expanded to a set of the requested size.
+	greedy_set, _ := s.GetBest()
+	greedy_set = Difference(greedy_set, excluding)
+	for i := 0; greedy_set.Size() < size && i < len(s.problem.instructions); i++ {
+		cur := s.problem.instructions[i].instruction
+		if !excluding.Contains(cur) {
+			greedy_set = greedy_set.Add(cur)
+		}
+	}
+	best := greedy_set
+
+	fmt.Printf("Evaluating greedy set:\n")
+	greedy_set.Print(&s.problem.instruction_index)
+
+	bound := s.Eval(greedy_set)
+
+	// To find the best solutions on this stage we use a branch & bound algorithm.
+	worklist := &WorkList{}
+	heap.Push(worklist, Candidate{
+		instruction_set:   InstructionSet{},
+		minimum_potential: 0,
+		maximum_potential: s.getUpperBoundForExtraSavings(size, InstructionSet{}),
+	})
+
+	steps := 0
+	seen := map[InstructionSet]int{}
+	for worklist.Len() > 0 {
+		candidate := heap.Pop(worklist).(Candidate)
+
+		// check whether the candidate is still of interest.
+		if candidate.maximum_potential < bound {
+			continue
+		}
+
+		steps++
+		fmt.Printf("\n")
+		fmt.Printf("Stage %d - Step %d - worklist lenght %d\n", size, steps, worklist.Len())
+
+		// Evaluate current instruction set.
+		fmt.Printf("Evaluating\n")
+		candidate.instruction_set.Print(&s.problem.instruction_index)
+
+		value := s.Eval(candidate.instruction_set)
+
+		fmt.Printf("Estimated min potential: %30d\n", candidate.minimum_potential)
+		fmt.Printf("Actual savings:          %30d\n", value)
+		fmt.Printf("Curent best:             %30d\n", bound)
+		fmt.Printf("Estimated max potential: %30d\n", candidate.maximum_potential)
+		if value > bound {
+			fmt.Printf("NEW BEST!\n")
+			best = candidate.instruction_set
+			bound = value
+		}
+
+		// Expand instruction set.
+		if candidate.instruction_set.Size() < size {
+			for _, instruction := range s.problem.instructions {
+				// Do not include excluded instructions.
+				if excluding.Contains(instruction.instruction) {
+					continue
+				}
+				// Do not include already present instructions.
+				if candidate.instruction_set.Contains(instruction.instruction) {
+					continue
+				}
+
+				extended := candidate.instruction_set.Add(instruction.instruction)
+
+				// Filter out previously encountered sets.
+				if _, present := seen[extended]; present {
+					continue
+				}
+				seen[extended] = 0
+
+				min_potential := value
+				max_potential := value + int64(instruction.savings) + s.getUpperBoundForExtraSavings(size, extended)
+
+				if max_potential > bound {
+					heap.Push(worklist, Candidate{
+						instruction_set:   extended,
+						minimum_potential: min_potential,
+						maximum_potential: max_potential,
+					})
+				} else {
+					// Since instructions are ordered by their savings, nothing better will follow.
+					break
+				}
+			}
+		}
+	}
+
+	return best
+}
+
+// Estimates an upper boundary of the maximum extra savings that can be obtained by expanding the given
+// instruction set to the provided budget.
+func (s *StagedSolverState) getUpperBoundForExtraSavings(budget int, set InstructionSet) int64 {
+	// TODO: improve using savings already computed for non-singleton sets
+
+	// Empty sets need special handling to avoid recursive dependencies.
+	if set.Empty() {
+		// We use the best known solution for a one unit smaller budget ..
+		best := s.FindBest(SubProblem{budget: budget - 1})
+
+		// and add the potential of the most promising instruction not included in the set.
+		for _, instruction := range s.problem.instructions {
+			if !best.Contains(instruction.instruction) {
+				return s.Eval(best) + int64(instruction.savings)
+			}
+		}
+		/*
+			var sum int64
+			for _, instruction := range s.problem.instructions {
+				if set.Size() >= budget {
+					return sum
+				}
+				if !set.Contains(instruction.instruction) {
+					set = set.Add(instruction.instruction)
+					sum += int64(instruction.savings)
+				}
+			}
+			return sum
+		*/
+	}
+
+	// See how much extra space there is.
+	space := budget - set.Size()
+
+	// See what is the best combination for this extra space.
+	if _, present := s.sub_best[SubProblem{budget: space}]; !present {
+		panic(fmt.Sprintf("Subproblem %v not precomuted!", SubProblem{budget: space}))
+	}
+	best := s.FindBest(SubProblem{budget: space})
+
+	// Check whether there are overlaps.
+	overlap := Intersect(best, set)
+
+	// If there are none, the best solution for the remaining space is the tightest boundary we have.
+	if overlap.Empty() {
+		return s.Eval(best)
+	}
+
+	// If there are overlap, look for the best solution without overlap.
+	if _, present := s.sub_best[SubProblem{budget: space, excluding: overlap}]; !present {
+		panic(fmt.Sprintf("Subproblem %v not precomuted!", SubProblem{budget: space, excluding: overlap}))
+	}
+	best = s.FindBest(SubProblem{budget: space, excluding: overlap})
+	return s.Eval(best)
+}
+
+// Evaluates the actual savings of the givne instruction set. Results are cached.
+func (s *StagedSolverState) Eval(set InstructionSet) int64 {
+	val, present := s.eval_data[set]
+	if present {
+		return val
+	}
+	val = getSavings(s.problem.block_structure, set, s.workers)
+	s.eval_data[set] = val
+	return val
+}
+
+func (s *StagedSolverState) GetBest() (best InstructionSet, max int64) {
+	for k, v := range s.eval_data {
+		if v > max {
+			best = k
+			max = v
+		}
+	}
+	return
 }

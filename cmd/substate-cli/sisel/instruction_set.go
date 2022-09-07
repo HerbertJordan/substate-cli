@@ -97,6 +97,28 @@ func (s *InstructionSet) Add(si SuperInstructionId) InstructionSet {
 	return Union(*s, MakeSingletonSet(si))
 }
 
+func (s *InstructionSet) Remove(si SuperInstructionId) InstructionSet {
+	if !s.Contains(si) {
+		return *s
+	}
+	return Difference(*s, MakeSingletonSet(si))
+}
+
+func (s *InstructionSet) GetSubsets() []InstructionSet {
+	num := 1 << s.Size()
+	res := make([]InstructionSet, num)
+	for i := 0; i < num; i++ {
+		cur := InstructionSet{}
+		for j := 0; j < s.Size(); j++ {
+			if i>>j&0x1 > 0 {
+				cur = cur.Add(s.At(j))
+			}
+		}
+		res[i] = cur
+	}
+	return res
+}
+
 func Union(a, b InstructionSet) InstructionSet {
 	if a.Empty() {
 		return b
@@ -161,6 +183,40 @@ func Intersect(a, b InstructionSet) InstructionSet {
 		binary.Write(buf, binary.LittleEndian, next_a)
 		i++
 		j++
+	}
+
+	return InstructionSet{buf.String()}
+}
+
+func Difference(a, b InstructionSet) InstructionSet {
+	if a.Empty() {
+		return a
+	}
+	if b.Empty() {
+		return a
+	}
+	buf := bytes.NewBuffer(make([]byte, 0, (a.Size()+b.Size())*4))
+
+	i, j := 0, 0
+	for i < a.Size() && j < b.Size() {
+		next_a := a.At(i)
+		next_b := b.At(j)
+		if next_a < next_b {
+			binary.Write(buf, binary.LittleEndian, next_a)
+			i++
+			continue
+		}
+		if next_b < next_a {
+			j++
+			continue
+		}
+		i++
+		j++
+	}
+
+	// Append rest of a
+	for ; i < a.Size(); i++ {
+		binary.Write(buf, binary.LittleEndian, a.At(i))
 	}
 
 	return InstructionSet{buf.String()}
