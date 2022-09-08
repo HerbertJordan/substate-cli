@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"runtime/pprof"
+	"sort"
 	"strconv"
 	"time"
 
@@ -204,9 +205,16 @@ type FlatStorage struct {
 	loc_index         map[loc]loc_id
 	reverse_loc_index map[loc_id]loc
 
-	counter       int
+	// total number of accesses
+	counter int
+
+	// bucket accesses and history
 	bucket_counts []uint64
 	count_lists   [][]uint64
+
+	// dirty buckets per block
+	dirty_buckets    map[int]int
+	dirty_bucket_log []int
 }
 
 func NewFlatStorage(config FlatStorageConfig) *FlatStorage {
@@ -218,6 +226,8 @@ func NewFlatStorage(config FlatStorageConfig) *FlatStorage {
 		reverse_loc_index: map[loc_id]loc{},
 		bucket_counts:     make([]uint64, 0),
 		count_lists:       make([][]uint64, 0),
+		dirty_buckets:     map[int]int{},
+		dirty_bucket_log:  make([]int, 0),
 	}
 }
 
@@ -256,6 +266,7 @@ func (s *FlatStorage) access(pos loc_id) {
 		s.bucket_counts = append(s.bucket_counts, make([]uint64, int(bucket)-len(s.bucket_counts)+1)...)
 	}
 	s.bucket_counts[bucket]++
+	s.dirty_buckets[int(bucket)] = 0
 
 	if s.config.self_optimize {
 		// Swap location with parent
@@ -272,6 +283,7 @@ func (s *FlatStorage) access(pos loc_id) {
 		// Register swap as an access.
 		bucket = parent_pos / (1 << 15)
 		s.bucket_counts[bucket]++
+		s.dirty_buckets[int(bucket)] = 0
 	}
 
 	// Collect statistics.
@@ -293,16 +305,24 @@ func (s *FlatStorage) Store(addr common.Address, key common.Hash, value common.H
 }
 
 func (s *FlatStorage) Start(_ TransactionId) {}
-func (s *FlatStorage) End(_ TransactionId)   {}
+
+func (s *FlatStorage) End(_ TransactionId) {
+	// log number of dirty buckets and reset
+	s.dirty_bucket_log = append(s.dirty_bucket_log, len(s.dirty_buckets))
+	s.dirty_buckets = map[int]int{}
+}
 
 func (s *FlatStorage) PrintSummary() {
+
+	fmt.Printf("\nFlat storage, self optimization enabled: %t\n", s.config.self_optimize)
+
 	max_length := 0
 	for _, list := range s.count_lists {
 		if len(list) > max_length {
 			max_length = len(list)
 		}
 	}
-	fmt.Printf("Access Counts:\n")
+	fmt.Printf("\nAccess Counts:\n")
 	for _, list := range s.count_lists {
 		//fmt.Printf("%d", i)
 		for _, count := range list {
@@ -313,4 +333,25 @@ func (s *FlatStorage) PrintSummary() {
 		}
 		fmt.Printf("\n")
 	}
+
+	fmt.Printf("\nDirty Buckets Distribution:\n")
+
+	// Development of dirty bucket usage over time.
+	const window_length = 1_000_000
+	for i := 0; i < len(s.dirty_bucket_log)-window_length; i += window_length {
+		data := s.dirty_bucket_log[i : i+window_length]
+		sort.Slice(data, func(i, j int) bool { return data[i] < data[j] })
+		for i := 0; i < 100; i++ {
+			fmt.Printf("%d ", data[len(data)*i/100])
+		}
+		fmt.Printf("%d\n", data[len(data)-1])
+	}
+
+	// Overall dirty bucket distributions
+	sort.Slice(s.dirty_bucket_log, func(i, j int) bool { return s.dirty_bucket_log[i] < s.dirty_bucket_log[j] })
+
+	for i := 0; i < 100; i++ {
+		fmt.Printf("%d, %d\n", i, s.dirty_bucket_log[len(s.dirty_bucket_log)*i/100])
+	}
+	fmt.Printf("100, %d\n", s.dirty_bucket_log[len(s.dirty_bucket_log)-1])
 }
