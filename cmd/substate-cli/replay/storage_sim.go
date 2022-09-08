@@ -13,7 +13,12 @@ import (
 	"gopkg.in/urfave/cli.v1"
 )
 
-// record-replay: substate-cli location-stats command
+var EnableSelfOptimizationDbFlag = cli.BoolFlag{
+	Name:  "selfoptimize",
+	Usage: "enables the self-optimization feature in the simulated storage system",
+}
+
+// record-replay: substate-cli storage-sim command
 var GetStorageSimCommand = cli.Command{
 	Action:    getStorageSimulationAction,
 	Name:      "storage-sim",
@@ -23,6 +28,7 @@ var GetStorageSimCommand = cli.Command{
 		substate.WorkersFlag,
 		substate.SubstateDirFlag,
 		CpuProfilingFlag,
+		EnableSelfOptimizationDbFlag,
 		ChainIDFlag,
 	},
 	Description: `
@@ -41,18 +47,15 @@ type TransactionId struct {
 	tx    int
 }
 
-func less(a, b TransactionId) bool {
-	if a.block < b.block {
-		return true
-	}
-	return a.block == b.block && a.tx < b.tx
-}
-
-// SimulatedStorage defines an interface for a simulated storage to which all
-// a simulated traffic stream is directed.
+// SimulatedStorage defines an interface for a simulated storage to which
+// a simulated traffic stream is directed to.
 type SimulatedStorage interface {
 	Load(addr common.Address, key common.Hash) common.Hash
 	Store(addr common.Address, key common.Hash, value common.Hash)
+
+	Start(tx TransactionId)
+	End(tx TransactionId)
+
 	PrintSummary()
 }
 
@@ -93,8 +96,11 @@ func getStorageSimulationAction(ctx *cli.Context) error {
 	substate.OpenSubstateDBReadOnly()
 	defer substate.CloseSubstateDB()
 
-	//store := CountingStorage{}
-	store := NewFlatStorage()
+	var store SimulatedStorage
+	store = &CountingStorage{}
+	store = NewFlatStorage(FlatStorageConfig{
+		self_optimize: ctx.Bool(EnableSelfOptimizationDbFlag.Name),
+	})
 	defer store.PrintSummary()
 
 	// Start CPU profiling if requested.
@@ -115,31 +121,36 @@ func getStorageSimulationAction(ctx *cli.Context) error {
 	step := 0
 	start := time.Now()
 	for iter.Next() {
-		value := iter.Value()
-		if value == nil || value.Block > uint64(last) {
+		transaction := iter.Value()
+		if transaction == nil || transaction.Block > uint64(last) {
 			return nil
 		}
+		tx_id := TransactionId{transaction.Block, transaction.Transaction}
+
+		store.Start(tx_id)
 
 		// Simulate read operations of this transaction.
-		for addr, account := range value.Substate.InputAlloc {
-			for key, _ := range account.Storage {
+		for addr, account := range transaction.Substate.InputAlloc {
+			for key := range account.Storage {
 				store.Load(addr, key)
 			}
 		}
 
 		// Simulate write operations of this transaction.
-		for addr, account := range value.Substate.OutputAlloc {
+		for addr, account := range transaction.Substate.OutputAlloc {
 			for key, value := range account.Storage {
 				store.Store(addr, key, value)
 			}
 		}
+
+		store.End(tx_id)
 
 		// Some eye candy to show progress.
 		step++
 		if step%100000 == 0 {
 			duration := time.Since(start)
 			throughput := float64(step) / duration.Seconds()
-			fmt.Printf("Processed block %d, transaction %d, t=%v, %.1f tx/s\n", value.Block, value.Transaction, duration, throughput)
+			fmt.Printf("Processed block %d, transaction %d, t=%v, %.1f tx/s\n", transaction.Block, transaction.Transaction, duration, throughput)
 		}
 	}
 
@@ -162,6 +173,9 @@ func (s *CountingStorage) Store(addr common.Address, key common.Hash, value comm
 	s.stores++
 }
 
+func (s *CountingStorage) Start(_ TransactionId) {}
+func (s *CountingStorage) End(_ TransactionId)   {}
+
 func (s *CountingStorage) PrintSummary() {
 	fmt.Printf("Number of Loads:  %d\n", s.loads)
 	fmt.Printf("Number of Stores: %d\n", s.stores)
@@ -178,7 +192,13 @@ type loc struct {
 	key_id  key_id
 }
 
+type FlatStorageConfig struct {
+	self_optimize bool
+}
+
 type FlatStorage struct {
+	config FlatStorageConfig
+
 	addr_index        map[common.Address]addr_id
 	key_index         map[common.Hash]key_id
 	loc_index         map[loc]loc_id
@@ -189,8 +209,9 @@ type FlatStorage struct {
 	count_lists   [][]uint64
 }
 
-func NewFlatStorage() *FlatStorage {
+func NewFlatStorage(config FlatStorageConfig) *FlatStorage {
 	return &FlatStorage{
+		config:            config,
 		addr_index:        map[common.Address]addr_id{},
 		key_index:         map[common.Hash]key_id{},
 		loc_index:         map[loc]loc_id{},
@@ -236,20 +257,22 @@ func (s *FlatStorage) access(pos loc_id) {
 	}
 	s.bucket_counts[bucket]++
 
-	// Swap location with parent
-	loc := s.reverse_loc_index[pos]
-	parent_pos := pos / 2
-	parent_loc := s.reverse_loc_index[parent_pos]
+	if s.config.self_optimize {
+		// Swap location with parent
+		loc := s.reverse_loc_index[pos]
+		parent_pos := pos / 2
+		parent_loc := s.reverse_loc_index[parent_pos]
 
-	s.loc_index[parent_loc] = pos
-	s.reverse_loc_index[pos] = parent_loc
+		s.loc_index[parent_loc] = pos
+		s.reverse_loc_index[pos] = parent_loc
 
-	s.loc_index[loc] = parent_pos
-	s.reverse_loc_index[parent_pos] = loc
+		s.loc_index[loc] = parent_pos
+		s.reverse_loc_index[parent_pos] = loc
 
-	// Register swap as an access.
-	bucket = parent_pos / (1 << 15)
-	s.bucket_counts[bucket]++
+		// Register swap as an access.
+		bucket = parent_pos / (1 << 15)
+		s.bucket_counts[bucket]++
+	}
 
 	// Collect statistics.
 	s.counter++
@@ -268,6 +291,9 @@ func (s *FlatStorage) Load(addr common.Address, key common.Hash) common.Hash {
 func (s *FlatStorage) Store(addr common.Address, key common.Hash, value common.Hash) {
 	s.access(s.getLocationId(addr, key))
 }
+
+func (s *FlatStorage) Start(_ TransactionId) {}
+func (s *FlatStorage) End(_ TransactionId)   {}
 
 func (s *FlatStorage) PrintSummary() {
 	max_length := 0
