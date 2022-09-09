@@ -54,8 +54,11 @@ type SimulatedStorage interface {
 	Load(addr common.Address, key common.Hash) common.Hash
 	Store(addr common.Address, key common.Hash, value common.Hash)
 
-	Start(tx TransactionId)
-	End(tx TransactionId)
+	StartBlock(block uint64)
+	EndBlock(block uint64)
+
+	StartTransaction(tx TransactionId)
+	EndTransaction(tx TransactionId)
 
 	PrintSummary()
 }
@@ -121,6 +124,7 @@ func getStorageSimulationAction(ctx *cli.Context) error {
 	defer iter.Release()
 	step := 0
 	start := time.Now()
+	last_block := uint64(0)
 	for iter.Next() {
 		transaction := iter.Value()
 		if transaction == nil || transaction.Block > uint64(last) {
@@ -128,7 +132,15 @@ func getStorageSimulationAction(ctx *cli.Context) error {
 		}
 		tx_id := TransactionId{transaction.Block, transaction.Transaction}
 
-		store.Start(tx_id)
+		if tx_id.block != last_block {
+			if last_block > 0 {
+				store.EndBlock(uint64(last_block))
+			}
+			store.StartBlock(tx_id.block)
+			last_block = tx_id.block
+		}
+
+		store.StartTransaction(tx_id)
 
 		// Simulate read operations of this transaction.
 		for addr, account := range transaction.Substate.InputAlloc {
@@ -144,7 +156,7 @@ func getStorageSimulationAction(ctx *cli.Context) error {
 			}
 		}
 
-		store.End(tx_id)
+		store.EndTransaction(tx_id)
 
 		// Some eye candy to show progress.
 		step++
@@ -153,6 +165,10 @@ func getStorageSimulationAction(ctx *cli.Context) error {
 			throughput := float64(step) / duration.Seconds()
 			fmt.Printf("Processed block %d, transaction %d, t=%v, %.1f tx/s\n", transaction.Block, transaction.Transaction, duration, throughput)
 		}
+	}
+
+	if last_block > 0 {
+		store.EndBlock(uint64(last_block))
 	}
 
 	return err
@@ -174,8 +190,11 @@ func (s *CountingStorage) Store(addr common.Address, key common.Hash, value comm
 	s.stores++
 }
 
-func (s *CountingStorage) Start(_ TransactionId) {}
-func (s *CountingStorage) End(_ TransactionId)   {}
+func (s *CountingStorage) StartBlock(_ uint64) {}
+func (s *CountingStorage) EndBlock(_ uint64)   {}
+
+func (s *CountingStorage) StartTransaction(_ TransactionId) {}
+func (s *CountingStorage) EndTransaction(_ TransactionId)   {}
 
 func (s *CountingStorage) PrintSummary() {
 	fmt.Printf("Number of Loads:  %d\n", s.loads)
@@ -304,13 +323,15 @@ func (s *FlatStorage) Store(addr common.Address, key common.Hash, value common.H
 	s.access(s.getLocationId(addr, key))
 }
 
-func (s *FlatStorage) Start(_ TransactionId) {}
-
-func (s *FlatStorage) End(_ TransactionId) {
+func (s *FlatStorage) StartBlock(_ uint64) {}
+func (s *FlatStorage) EndBlock(_ uint64) {
 	// log number of dirty buckets and reset
 	s.dirty_bucket_log = append(s.dirty_bucket_log, len(s.dirty_buckets))
 	s.dirty_buckets = map[int]int{}
 }
+
+func (s *FlatStorage) StartTransaction(_ TransactionId) {}
+func (s *FlatStorage) EndTransaction(_ TransactionId)   {}
 
 func (s *FlatStorage) PrintSummary() {
 
