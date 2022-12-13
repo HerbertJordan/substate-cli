@@ -222,6 +222,16 @@ func (db *inMemoryStateDB) HasSuicided(addr common.Address) bool {
 	return false
 }
 
+func (db *inMemoryStateDB) GetSuicidedAccounts() []common.Address {
+	res := []common.Address{}
+	for state := db.state; state != nil; state = state.parent {
+		for key := range state.suicided {
+			res = append(res, key)
+		}
+	}
+	return res
+}
+
 func (db *inMemoryStateDB) Exist(addr common.Address) bool {
 	for state := db.state; state != nil; state = state.parent {
 		_, exists := state.touched[addr]

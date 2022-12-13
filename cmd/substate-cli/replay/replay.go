@@ -95,8 +95,12 @@ func getVmDuration() time.Duration {
 	return time.Duration(atomic.LoadInt64((*int64)(&vm_duration)))
 }
 
+type SuicideAccountLister interface {
+	GetSuicidedAccounts() []common.Address
+}
+
 // replayTask replays a transaction substate
-func replayTask(config ReplayConfig, block uint64, tx int, recording *substate.Substate, taskPool *substate.SubstateTaskPool) error {
+func replayTask(config ReplayConfig, block uint64, tx int, recording *substate.Substate, taskPool *substate.SubstateTaskPool, destroyedAccountDb *substate.DestroyedAccountDB) error {
 
 	// If requested, skip failed transactions.
 	if config.only_successful && recording.Result.Status != types.ReceiptStatusSuccessful {
@@ -186,6 +190,14 @@ func replayTask(config ReplayConfig, block uint64, tx int, recording *substate.S
 	if err != nil {
 		statedb.RevertToSnapshot(snapshot)
 		return err
+	}
+
+	if provider := statedb.(SuicideAccountLister); provider != nil {
+		destroyed := provider.GetSuicidedAccounts()
+		if len(destroyed) != 0 {
+			fmt.Printf("%d contains %d destroyed accounts\n", block, len(destroyed))
+			destroyedAccountDb.SetDestroyedAccounts(block, destroyed)
+		}
 	}
 
 	if hashError != nil {
@@ -462,8 +474,11 @@ func replayAction(ctx *cli.Context) error {
 		use_in_memory_db: ctx.Bool(UseInMemoryStateDbFlag.Name),
 	}
 
+	destroyedAccountDb := substate.OpenDestroyedAccountDB("./destroyed_accounts")
+	defer destroyedAccountDb.Close()
+
 	task := func(block uint64, tx int, recording *substate.Substate, taskPool *substate.SubstateTaskPool) error {
-		return replayTask(config, block, tx, recording, taskPool)
+		return replayTask(config, block, tx, recording, taskPool, destroyedAccountDb)
 	}
 
 	resetVmDuration()
